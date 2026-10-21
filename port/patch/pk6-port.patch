@@ -1,0 +1,137 @@
+diff --git a/app/build.gradle b/app/build.gradle
+index 3ae8272..33012ae 100644
+--- a/app/build.gradle
++++ b/app/build.gradle
+@@ -88,6 +88,10 @@ android {
+             versionName = props.getValue('MIDlet-Version')
+             resValue 'string', 'app_name', midletName
+             midletArchivesBaseName = apkName
++            // Port: so ARM (celulares reais). Tira x86/x86_64 e economiza ~5 MB de libs nativas.
++            ndk {
++                abiFilters 'armeabi-v7a', 'arm64-v8a'
++            }
+             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'),
+                     'proguard-midlet.pro', 'proguard-common.pro'
+         }
+@@ -161,7 +165,48 @@ def getMidletManifestProperties() {
+     return mf.mainAttributes
+ }
+ 
++// ---------------------------------------------------------------------------
++// PORT (flavor "midlet"): embute o jogo (app/port/PetKingdom6.jar) no APK.
++//
++// 1) compilePortTool   compila tools/port/InstrumentJar.java + AndroidProducer (ASM),
++//                      o mesmo conversor que o app usa ao importar um .jar.
++// 2) instrumentGameJar aplica a instrumentacao nas classes e copia os recursos
++//                      (imagens, .mid, .ui...) para build/port/game-instrumented.jar.
++// 3) o jar resultante entra como dependencia do flavor midlet; o D8/R8 converte as
++//    classes para dex e o AGP empacota os recursos no APK.
++// ---------------------------------------------------------------------------
++configurations {
++    portTool
++}
++
++def portJarIn = file('port/PetKingdom6.jar')
++def portOutDir = layout.buildDirectory.dir('port').get().asFile
++def portToolDir = new File(portOutDir, 'tool')
++def portJarOut = new File(portOutDir, 'game-instrumented.jar')
++
++tasks.register('compilePortTool', JavaCompile) {
++    source fileTree(dir: "${rootDir}/dexlib/src/main/java/org/microemu/android/asm", include: '*.java')
++    source "${rootDir}/tools/port/InstrumentJar.java"
++    classpath = configurations.portTool
++    destinationDirectory.set(portToolDir)
++    options.release.set(11)
++}
++
++tasks.register('instrumentGameJar', JavaExec) {
++    dependsOn 'compilePortTool'
++    classpath = configurations.portTool + files(portToolDir)
++    mainClass.set('InstrumentJar')
++    args portJarIn.absolutePath, portJarOut.absolutePath
++    inputs.file portJarIn
++    outputs.file portJarOut
++}
++
+ dependencies {
++    portTool 'org.ow2.asm:asm:9.11'
++    midletImplementation(files(portJarOut)) {
++        builtBy 'instrumentGameJar'
++    }
++
+     def roomVersion = '2.6.1' // api 19
+     def cameraxVersion = "1.6.2"
+     def autoServiceVersion = "1.1.1"
+diff --git a/app/proguard-midlet.pro b/app/proguard-midlet.pro
+index e7c2d7e..2009651 100644
+--- a/app/proguard-midlet.pro
++++ b/app/proguard-midlet.pro
+@@ -38,4 +38,23 @@
+ 
+ # -keep public class mypackage.MyClass
+ # -keep public interface mypackage.MyInterface
+-# -keep public class * implements mypackage.MyInterface
+\ No newline at end of file
++# -keep public class * implements mypackage.MyInterface
++
++# ---- Port Pet Kingdom 6 ------------------------------------------------------
++# O jogo usa Class.forName / reflexao em alguns pontos (CWATools, WMASender), e as
++# classes dele sao pequenas: nao encolher nem ofuscar os pacotes do jogo.
++-keep class game.** { *; }
++-keep class CWA2DAPI.** { *; }
++-keep class CWAEvent.** { *; }
++-keep class CWAUI.** { *; }
++-keep class com.zy.** { *; }
++-keep class com.sina.** { *; }
++-keep class XConnection { *; }
++-keep class XMessage { *; }
++
++# APIs opcionais do J2ME que o jogo referencia mas o app pode nao embutir.
++-dontwarn javax.wireless.**
++-dontwarn javax.microedition.**
++-dontwarn com.nokia.**
++-dontwarn com.siemens.**
++-ignorewarnings
+diff --git a/app/src/main/java/javax/microedition/shell/MicroActivity.java b/app/src/main/java/javax/microedition/shell/MicroActivity.java
+index c5e4b15..1d81081 100644
+--- a/app/src/main/java/javax/microedition/shell/MicroActivity.java
++++ b/app/src/main/java/javax/microedition/shell/MicroActivity.java
+@@ -81,6 +81,7 @@ import javax.microedition.util.ContextHolder;
+ import io.reactivex.SingleObserver;
+ import io.reactivex.disposables.Disposable;
+ import ru.playsoftware.j2meloader.BuildConfig;
++import ru.playsoftware.j2meloader.PortSeed;
+ import ru.playsoftware.j2meloader.R;
+ import ru.playsoftware.j2meloader.config.Config;
+ import ru.playsoftware.j2meloader.databinding.ActivityMicroBinding;
+@@ -118,10 +119,17 @@ public class MicroActivity extends AppCompatActivity {
+ 
+ 		SharedPreferences sp = PreferenceManager.getDefaultSharedPreferences(getApplicationContext());
+ 		actionBarEnabled = sp.getBoolean(PREF_TOOLBAR, false);
+-		statusBarEnabled = sp.getBoolean(PREF_STATUSBAR, false);
+-		if (sp.getBoolean(PREF_ADD_CUTOUT_AREA, false) && Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+-			getWindow().getAttributes().layoutInDisplayCutoutMode =
+-					WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
++		// APK "port" (flavor midlet): sempre em tela cheia, sem barra de status e usando a
++		// area do recorte da camera (notch/furo). No emulador completo vale a preferencia.
++		boolean portMode = !BuildConfig.FULL_EMULATOR;
++		statusBarEnabled = !portMode && sp.getBoolean(PREF_STATUSBAR, false);
++		if ((portMode || sp.getBoolean(PREF_ADD_CUTOUT_AREA, false)) && Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
++			getWindow().getAttributes().layoutInDisplayCutoutMode = Build.VERSION.SDK_INT >= Build.VERSION_CODES.R
++					? WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
++					: WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
++		}
++		if (portMode) {
++			hideSystemUI();
+ 		}
+ 		if (sp.getBoolean(PREF_KEEP_SCREEN, false)) {
+ 			getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+@@ -144,6 +152,8 @@ public class MicroActivity extends AppCompatActivity {
+ 			if (!dir.exists() && !dir.mkdirs()) {
+ 				throw new RuntimeException("Can't access file system");
+ 			}
++			// Copia config.json, teclado virtual e shader embutidos no APK (1a execucao)
++			PortSeed.seed(this, appPath);
+ 		}
+ 		String arguments = intent.getStringExtra(KEY_START_ARGUMENTS);
+ 		if (arguments != null) {

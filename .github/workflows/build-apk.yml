@@ -1,0 +1,59 @@
+name: Build APK (Pet Kingdom 6)
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Cache do Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('port/upstream-commit.txt', 'port/patch/*.patch') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      - name: Baixar J2ME Loader (versao fixa) e aplicar o port
+        run: bash port/apply.sh "$GITHUB_WORKSPACE/build/J2ME-Loader"
+
+      - name: Assinatura
+        env:
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+          KEYSTORE_PROPERTIES: ${{ secrets.KEYSTORE_PROPERTIES }}
+        run: bash port/sign-setup.sh "$GITHUB_WORKSPACE/build/J2ME-Loader"
+
+      - name: Licencas do Android SDK
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - name: Compilar
+        working-directory: build/J2ME-Loader
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon assembleMidletRelease
+
+      - name: Coletar APK
+        run: |
+          mkdir -p dist
+          cp build/J2ME-Loader/app/build/outputs/apk/midlet/release/*.apk dist/
+          ls -la dist
+
+      - name: Enviar APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: PetKingdom6-apk
+          path: dist/*.apk
